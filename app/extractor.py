@@ -1,45 +1,55 @@
 import fitz  # PyMuPDF
 import re
 
-# --- Configuration ---
-IGNORED_HEADINGS = [
-    "Acknowledgements", "Revision History", "Table of Contents",
-    "Version", "Copyright Notice"
-]
-
-# --- Helper functions ---
+MAX_HEADING_WORDS = 25
+MAX_HEADING_CHARS = 120
 
 def clean_text(text):
-    return re.sub(r'\s+', ' ', text.strip())
+    text = re.sub(r'\s+', ' ', text.strip())
+    return re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
 
 def is_useful_heading(text):
     if not text or len(text) < 3:
         return False
-    if any(skip.lower() in text.lower() for skip in IGNORED_HEADINGS):
+    if len(text.split()) > MAX_HEADING_WORDS:
+        return False
+    if len(text) > MAX_HEADING_CHARS:
         return False
     return True
 
+def is_toc_entry(text):
+    return bool(re.match(r'^\d+(\.\d+)*\s+.+\s+\d{1,2}$', text))
+
 def classify_by_pattern(text):
-    """
-    Classifies heading level using regex patterns like:
-    - 1.               => H1
-    - 1.1 or 1.2.3     => H2 or H3 depending on depth
-    """
     pattern = re.match(r'^(\d+(\.\d+){0,2})', text)
     if pattern:
         levels = pattern.group(0).count('.')
-        if levels == 0:
-            return "H1"
-        elif levels == 1:
-            return "H2"
-        else:
-            return "H3"
+        return ["H1", "H2", "H3"][min(levels, 2)]
     return None
 
-# --- Main function ---
+def extract_title(doc):
+    page = doc[0]
+    spans = []
+
+    for block in page.get_text("dict")["blocks"]:
+        if "lines" not in block:
+            continue
+        for line in block["lines"]:
+            for span in line["spans"]:
+                text = clean_text(span["text"])
+                if len(text) >= 4:
+                    spans.append((span["size"], text))
+
+    spans.sort(reverse=True)
+    if len(spans) >= 2:
+        return spans[0][1] + "  " + spans[1][1]
+    elif spans:
+        return spans[0][1]
+    return "Untitled Document"
 
 def extract_headings(pdf_path):
     doc = fitz.open(pdf_path)
+    title = extract_title(doc)
     blocks = []
 
     for page_num, page in enumerate(doc, start=1):
@@ -59,11 +69,14 @@ def extract_headings(pdf_path):
                     font_sizes.append(span["size"])
 
             merged_text = clean_text(merged_text)
+
+            # Filter: ToC junk from page 4
+            if page_num == 4 and re.search(r'\d{1,2}$', merged_text):
+                continue
             if not is_useful_heading(merged_text):
                 continue
 
-            avg_size = sum(font_sizes) / len(font_sizes) if font_sizes else 0
-
+            avg_size = sum(font_sizes) / len(font_sizes)
             blocks.append({
                 "text": merged_text,
                 "size": avg_size,
@@ -71,51 +84,33 @@ def extract_headings(pdf_path):
             })
 
     if not blocks:
-        return {
-            "title": "Untitled Document",
-            "outline": []
-        }
+        return {"title": title, "outline": []}
 
-    # Sort by size to guess title
-    blocks.sort(key=lambda b: -b["size"])
-    title = blocks[0]["text"]
+    # Rank sizes → H1, H2, H3
+    unique_sizes = sorted({b["size"] for b in blocks}, reverse=True)
+    size_to_level = {size: f"H{i+1}" for i, size in enumerate(unique_sizes[:3])}
 
-    # Font-size based level (fallback)
-    size_ranks = sorted(list(set(b["size"] for b in blocks)), reverse=True)
-    size_to_level = {}
-    for i, size in enumerate(size_ranks[:3]):
-        size_to_level[size] = f"H{i+1}"
-
-    # Final heading classification
+    outline = []
     seen = set()
-    headings = []
 
     for block in blocks:
         text = block["text"]
-        page = block["page"]
         size = block["size"]
+        page = block["page"]
 
         if text in seen:
             continue
         seen.add(text)
 
-        # Prefer pattern classification
-        level = classify_by_pattern(text)
-
-        # Fallback: use font size
-        if not level:
-            level = size_to_level.get(size, None)
-
-        if not level:
-            continue
-
-        headings.append({
-            "level": level,
-            "text": text,
-            "page": page
-        })
+        level = classify_by_pattern(text) or size_to_level.get(size)
+        if level:
+            outline.append({
+                "level": level,
+                "text": text,
+                "page": page
+            })
 
     return {
         "title": title,
-        "outline": headings
+        "outline": outline
     }
